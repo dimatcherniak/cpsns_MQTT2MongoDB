@@ -1,0 +1,17 @@
+{
+    "MQTT_IN":
+    {
+        "TopicsToSubscribe": 
+        [
+            "cpsens/+/3053-B-120_sn_105283/slctd/acc/algnd_1024smpls/+"
+        ],
+        "QoS": 0
+    },
+    "Output": 
+    {
+        "SamplesToCollect": 1024,
+        "Explanation: ModifySubtopics": "Denotes how to modify every element of the topic. Empty = do nothing. Not empty = replace by the given string",
+        "ModifySubtopics":
+        ["","","","slctd","","algnd_1024smpls"]
+    }
+}
