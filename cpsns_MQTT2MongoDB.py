@@ -146,6 +146,9 @@ def main():
         if collectionName not in db.list_collection_names():
             db.create_collection(collectionName)
             print(f"Collection '{collectionName}' created.")
+            # index
+            db[collectionName].create_index([("timestamp",1)])
+            print("Index created on 'timestamp'.")
 
         # 3. Get the sampling frequency from the metadata
         if not bIsMetadataRead and bIsMetadata:
@@ -170,11 +173,16 @@ def main():
             rows = int((len(payload)-header_size)/elem_size/columns)
             array_shape = (rows, columns)
             array_dtype = f'float{8*elem_size}'
+            # simple statistics on the data
+            data_array = np.frombuffer(data_bytes, dtype=array_dtype).reshape(array_shape)
+            rms = np.sqrt(np.mean(data_array**2, axis=0))
+            print(f"rms: {rms}", file=sys.stderr)
             document = {
                 "timestamp": utcTimeStamp,
                 "sampling_rate": Fs,
                 "data_shape": array_shape,       # helpful for reconstructing
                 "data_dtype": array_dtype,        # e.g., 'float32'
+                "rms": rms.tolist(),
                 "data": bson.Binary(data_bytes)
             }
             db[collectionName].insert_one(document)
