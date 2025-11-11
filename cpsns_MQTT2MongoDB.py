@@ -3,7 +3,7 @@ from paho.mqtt.client import Client as MQTTClient
 from paho.mqtt.client import CallbackAPIVersion
 from paho.mqtt.client import MQTTv311
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import struct
 import queue
 import argparse
@@ -20,6 +20,35 @@ PRIVATE_CONFIG_FILE_DEFAULT = "private_config.json" # locate this file in the pr
 PUBLIC_CONFIG_FILE_DEFAULT = "public_config.json"   # this file can be located in a public folder 
 
 msgQueue = queue.Queue()
+
+'''
+Recursively compares two JSON-like Python objects (dict or list) and returns a list of differences.
+Reports missing keys in either object.
+Detects list length mismatches and element differences.
+Highlights value differences at specific paths.
+The path parameter tracks the current location within nested structures for clear reporting.
+'''
+def compare_json(obj1, obj2, path=""):
+    """Recursively compare two JSON-like objects and return a list of differences with detailed paths."""
+    diffs = []
+    if isinstance(obj1, dict) and isinstance(obj2, dict):
+        for key in obj1.keys() | obj2.keys():
+            new_path = f"{path}.{key}" if path else key
+            if key not in obj2:
+                diffs.append(f"Key '{new_path}' missing in second JSON")
+            elif key not in obj1:
+                diffs.append(f"Key '{new_path}' missing in first JSON")
+            else:
+                diffs.extend(compare_json(obj1[key], obj2[key], new_path))
+    elif isinstance(obj1, list) and isinstance(obj2, list):
+        for i, (v1, v2) in enumerate(zip(obj1, obj2)):
+            diffs.extend(compare_json(v1, v2, f"{path}[{i}]"))
+        if len(obj1) != len(obj2):
+            diffs.append(f"List length mismatch at '{path}'")
+    else:
+        if obj1 != obj2:
+            diffs.append(f"Value mismatch at '{path}': {obj1} != {obj2}")
+    return diffs
 
 def on_connect_in(mqttc_in, userdata, flags, rc, properties=None):
     global json_config_public, json_config_private
@@ -124,8 +153,9 @@ def main():
     db = client[database_name]
 
     bIsMetadataRead = False
+    stored_json_metadata = []
     while True:
-        msg = msgQueue.get()
+        msg = msgQueue.get() # <-- blocks indefinitely until an item is available
 
         # Business logic
         # 1. Analyse the topic
@@ -141,22 +171,73 @@ def main():
             printf(f"Unknown last topic component: {substrings[-1]}. Skip the message!", file=sys.stderr)
             continue
 
-        # 2. Generate collection name from the topic
-        collectionName = DAQ
-        if collectionName not in db.list_collection_names():
-            db.create_collection(collectionName)
-            print(f"Collection '{collectionName}' created.")
+        # 2a Create data collection. Its name comes from the MQTT topic
+        collection_name = DAQ
+        if collection_name not in db.list_collection_names():
+            db.create_collection(collection_name)
+            print(f"Collection '{collection_name}' created.")
             # index
-            db[collectionName].create_index([("timestamp",1)])
+            db[collection_name].create_index([("timestamp",1)])
             print("Index created on 'timestamp'.")
 
-        # 3. Get the sampling frequency from the metadata
-        if not bIsMetadataRead and bIsMetadata:
-            bIsMetadataRead = True
-            payload = json.loads(msg.payload)
-            Fs = payload["DataChunk"]["Fs"]
+        # 2b Create metadata collection.
+        metadata_collection_name = f"{collection_name}_metadata"
+        # create if it does not exist
+        if metadata_collection_name not in db.list_collection_names():
+            db.create_collection(metadata_collection_name)
+            print(f"Collection '{metadata_collection_name}' created.")
+            # index
+            db[metadata_collection_name].create_index([("UTCAtNewBatch",1)], unique=True) # or use upsert?
+            print("Index created on 'UTCAtNewBatch'.")        
 
-        # 4. If data message, prepare the document and store it
+        # 3. Add the metadata to the metadata colletion
+        if bIsMetadata:
+            bIsMetadataRead = True
+            current_json_metadata = json.loads(msg.payload)
+            # Get the sampling frequency from the metadata
+            Fs = current_json_metadata["DataChunk"]["Fs"]
+
+            if stored_json_metadata != current_json_metadata:
+                # Add a document to the metadata collection
+                # The idea is that for each data collection, like e.g., "3053-B-120_sn_105283"
+                # I will have a corresponding "3053-B-120_sn_105283_metadata" collection. This collection will have documents that
+                # 1. Have a field "DataCollectionName", e.g., "3053-B-120_sn_105283"
+                # 2. Have a UNIQUE INDEXED field "UTCAtDAQStart" --> "UTCAtNewBatch", that contains the timestamp (actually taken from the metadata, ["DataChunk"]["UTCAtDAQStart"])
+                # 3. Have a field "Metadata", that contains the latest metadata. "UTCAtDAQStart" is a part of the metadata
+
+                # Note:
+                # See AddMetadataCollectiontoDB.ipynb
+                # For the time being (Nov-2025), whilst the DTU test is running, I won't dare to change the code
+                # After the test, this should be done in this code
+                # For the time being, I MANUALLY added a "***_metadata" collection to the database
+                # See **** ---> AddMetadataCollectiontoDB.ipynb
+
+                document = {
+                    "DataCollectionName": collection_name,
+                    #"UTCAtDAQStart": datetime.fromisoformat(jsonMetadata["DataChunk"]["UTCAtDAQStart"]),
+                    "UTCAtNewBatch": datetime.now(timezone.utc),
+                    "Metadata": current_json_metadata
+                }
+
+                # Before adding to the collection, let's check if there is already a document with the same index
+                # Add to the collection    
+                try:
+                    db[metadata_collection_name].insert_one(document) # or .update_one(..., upsert=True)?
+                    print(f"A document with index {document['UTCAtNewBatch']} inserted to the collection {metadata_collection_name}.")
+                    print("Reason:")
+                    if not stored_json_metadata:
+                        print("This function block is just started --> expected a gap in the recordings.")
+                    else:
+                        print("While running, the metadata has changed. The detected different is:")
+                        diff = compare_json(current_json_metadata, stored_json_metadata, path="")
+                        print(json.dumps(diff,indent=2))
+
+                except DuplicateKeyError:
+                    print(f"Duplicated key: a document with index {document['UTCAtNewBatch']} already exist in the collection named {metadata_collection_name}", file=sys.stderr)
+                else:
+                    stored_json_metadata = current_json_metadata
+
+        # 5. If data message, prepare the document and store it
         if not bIsMetadata and bIsMetadataRead:
             # Fields: 'timestamp', 'sampling_rate', 'data_shape', 'data_dtype', 'data'
             # Parse the data...
@@ -179,24 +260,14 @@ def main():
             print(f"rms: {rms}", file=sys.stderr)
             document = {
                 "timestamp": utcTimeStamp,
-                "sampling_rate": Fs,
+                "sampling_rate": Fs,            # redundant, can be found in the metadata collection. Left for compatibility
                 "data_shape": array_shape,       # helpful for reconstructing
                 "data_dtype": array_dtype,        # e.g., 'float32'
                 "rms": rms.tolist(),
                 "data": bson.Binary(data_bytes)
             }
-            db[collectionName].insert_one(document)
-            print(f'Document is inserted to collection {collectionName} with timestamp {utcTimeStamp}!')
-
-        # TODO: new collection if data interrupted (e.g., new metadata or new UTCAtDAQStart)
-        '''
-        if bIsMetadata:
-            payload = json.loads(msg.payload)
-            collectionName = f'{DAQ}_Started_at_{payload["DataChunk"]["UTCAtDAQStart"]}'
-            if collectionName not in db.list_collection_names():
-                db.create_collection(collectionName)
-                print(f"Collection '{collectionName}' created.")
-        '''
+            db[collection_name].insert_one(document)
+            print(f'Document is inserted to collection {collection_name} with timestamp {utcTimeStamp}!')
 
 if __name__ == "__main__":
     main()
