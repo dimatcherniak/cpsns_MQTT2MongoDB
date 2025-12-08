@@ -264,7 +264,8 @@ def main():
                 "data_shape": array_shape,       # helpful for reconstructing
                 "data_dtype": array_dtype,        # e.g., 'float32'
                 "rms": rms.tolist(),
-                "data": bson.Binary(data_bytes)
+                "data": bson.Binary(data_bytes),
+                "samples_from_DAQ_start": samples_from_start # introduced 8-Dec-2025
             }
             db[collection_name].insert_one(document)
             print(f'Document is inserted to collection {collection_name} with timestamp {utcTimeStamp}!')
